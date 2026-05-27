@@ -1,0 +1,4 @@
+flask
+pypdf
+anthropic
+gunicorn
