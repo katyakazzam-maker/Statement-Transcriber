@@ -308,7 +308,7 @@ def process_job(job_id, files_data, opening_balance):
                     continue
             return datetime.max  # unparseable dates go to end
 
-        all_transactions.sort(key=lambda t: parse_date(t.get("date", "")))
+        all_transactions.sort(key=lambda t: (parse_date(t.get("date", "")), 0 if t.get("type") == "credit" else 1))
 
         # Recalculate running balance after sort
         balance = opening_balance
