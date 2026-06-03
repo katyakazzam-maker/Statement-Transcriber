@@ -285,6 +285,41 @@ def process_job(job_id, files_data, opening_balance):
                 chunk_count += 1
                 job["progress"] = chunk_count
 
+        # Sort chronologically — handle many date formats gracefully
+        from datetime import datetime
+
+        DATE_FORMATS = [
+            "%m/%d/%Y", "%m/%d/%y",
+            "%Y-%m-%d",
+            "%B %d, %Y", "%b %d, %Y",
+            "%B %d %Y",  "%b %d %Y",
+            "%d %B %Y",  "%d %b %Y",
+            "%m-%d-%Y",  "%m-%d-%y",
+            "%d/%m/%Y",
+        ]
+
+        def parse_date(date_str):
+            if not date_str:
+                return datetime.max
+            for fmt in DATE_FORMATS:
+                try:
+                    return datetime.strptime(date_str.strip(), fmt)
+                except ValueError:
+                    continue
+            return datetime.max  # unparseable dates go to end
+
+        all_transactions.sort(key=lambda t: parse_date(t.get("date", "")))
+
+        # Recalculate running balance after sort
+        balance = opening_balance
+        for t in all_transactions:
+            amt = float(t.get("amount", 0) or 0)
+            if t.get("type") == "credit":
+                balance = round(balance + amt, 2)
+            else:
+                balance = round(balance - amt, 2)
+            t["running_balance"] = balance
+
         job["transactions"] = all_transactions
         job["status"] = "done"
         job["count"] = len(all_transactions)
@@ -345,14 +380,15 @@ def download(job_id):
     txns = job["transactions"]
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["#", "Date", "Description", "Type", "Amount", "Running Balance"])
-    for i, t in enumerate(txns, 1):
+    w.writerow(["Date", "Description", "Amount", "Running Balance"])
+    for t in txns:
+        amt = float(t.get("amount", 0) or 0)
+        if t.get("type") == "debit":
+            amt = -amt
         w.writerow([
-            i,
             t.get("date", ""),
             t.get("description", ""),
-            t.get("type", ""),
-            f"{float(t.get('amount', 0) or 0):.2f}",
+            f"{amt:.2f}",
             f"{float(t.get('running_balance', 0) or 0):.2f}",
         ])
 
