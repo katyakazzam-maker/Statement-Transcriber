@@ -11,11 +11,9 @@ import anthropic
 from flask import Flask, request, send_file, jsonify
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-PAGES_PER_CHUNK   = 5
+PAGES_PER_CHUNK = 3  # smaller chunks = fewer skips on dense statements
 
 app = Flask(__name__)
-
-# In-memory job store: { job_id: { status, progress, total, transactions, error } }
 jobs = {}
 
 HTML = """
@@ -153,7 +151,6 @@ async function poll(jobId) {
         clearInterval(interval);
         bar.style.width = '100%';
         progressLabel.textContent = 'Done!';
-        // Download
         const dlRes = await fetch('/download/' + jobId);
         const blob = await dlRes.blob();
         const url = URL.createObjectURL(blob);
@@ -163,9 +160,7 @@ async function poll(jobId) {
         setStatus('✓ Done! ' + data.count + ' transactions exported to CSV.', 'done');
         btn.disabled = false;
       }
-    } catch(e) {
-      // network hiccup, keep polling
-    }
+    } catch(e) {}
   }, 3000);
 }
 
@@ -188,33 +183,36 @@ def pdf_chunk_bytes(reader, page_indices):
     return buf.getvalue()
 
 
-def transcribe_chunk(client, pdf_bytes, running_balance, chunk_num, total_chunks):
+def transcribe_chunk(client, pdf_bytes, running_balance, chunk_num, total_chunks, page_start, page_end):
     b64 = base64.b64encode(pdf_bytes).decode()
-    prompt = f"""You are a precise financial data extractor. This is chunk {chunk_num} of {total_chunks}.
 
-The running balance entering this chunk is ${running_balance:.2f}.
+    prompt = f"""You are a bank statement data extractor. You are processing pages {page_start} to {page_end} of a bank statement (chunk {chunk_num} of {total_chunks} total chunks).
 
-Extract EVERY transaction — do not skip, summarize, or truncate any.
+The running balance entering these pages is ${running_balance:.2f}.
 
-Return ONLY a raw JSON array with no markdown fences, no explanation:
+YOUR ONLY JOB: Extract every single transaction line from these exact pages. Nothing more, nothing less.
+
+CRITICAL RULES — read carefully:
+1. Extract ONLY transactions that are physically printed on these pages. Do NOT infer, predict, or carry over transactions from other pages.
+2. Do NOT skip any transaction, even if it looks like a duplicate.
+3. Do NOT include account summary lines, beginning balance lines, ending balance lines, or section headers.
+4. Do NOT hallucinate or invent transactions that are not on the page.
+5. If these pages contain NO transactions (e.g. cover page, address page, legal disclosures), return an empty array [].
+
+Return ONLY a raw JSON array — no markdown, no explanation, no preamble:
 [
   {{
-    "date": "MM/DD/YYYY",
-    "description": "full description",
+    "date": "date exactly as printed on statement",
+    "description": "full description exactly as printed",
     "type": "credit or debit",
     "amount": 0.00,
     "running_balance": 0.00
   }}
 ]
 
-Rules:
-- amount is always a positive number
-- type is "credit" for deposits/additions, "debit" for withdrawals/payments
-- running_balance = previous + amount (credit) or - amount (debit)
-- First transaction's starting balance is {running_balance:.2f}
-- Preserve exact chronological order
-- If no transactions on these pages, return []
-- Do NOT include summary/header/footer lines as transactions"""
+For type: "credit" = money coming IN (deposits, transfers in, interest). "debit" = money going OUT (withdrawals, payments, fees).
+For amount: always a positive number.
+For running_balance: calculate as previous_balance + amount (credit) or - amount (debit). First transaction starts from ${running_balance:.2f}."""
 
     msg = client.messages.create(
         model="claude-opus-4-5",
@@ -232,7 +230,7 @@ Rules:
     if raw.startswith("```"):
         parts = raw.split("```")
         raw = parts[1] if len(parts) > 1 else raw
-        if raw.startswith("json"):
+        if raw.lower().startswith("json"):
             raw = raw[4:]
     raw = raw.strip()
 
@@ -240,7 +238,10 @@ Rules:
         result = json.loads(raw)
     except Exception:
         start, end = raw.find("["), raw.rfind("]") + 1
-        result = json.loads(raw[start:end]) if start != -1 else []
+        try:
+            result = json.loads(raw[start:end]) if start != -1 else []
+        except Exception:
+            result = []
 
     return result if isinstance(result, list) else []
 
@@ -251,10 +252,9 @@ def process_job(job_id, files_data, opening_balance):
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         all_transactions = []
         running_balance = opening_balance
-        total_chunks = 0
 
-        # Count total chunks first
         parsed_files = []
+        total_chunks = 0
         for filename, file_bytes in files_data:
             if not filename.lower().endswith(".pdf"):
                 continue
@@ -262,16 +262,22 @@ def process_job(job_id, files_data, opening_balance):
             total_pages = len(reader.pages)
             chunks = [list(range(i, min(i + PAGES_PER_CHUNK, total_pages)))
                       for i in range(0, total_pages, PAGES_PER_CHUNK)]
-            parsed_files.append((filename, reader, chunks))
+            parsed_files.append((filename, reader, chunks, total_pages))
             total_chunks += len(chunks)
 
         job["total"] = total_chunks
         chunk_count = 0
 
-        for filename, reader, chunks in parsed_files:
+        for filename, reader, chunks, total_pages in parsed_files:
             for n, page_indices in enumerate(chunks, 1):
+                page_start = page_indices[0] + 1
+                page_end = page_indices[-1] + 1
+
                 chunk_pdf = pdf_chunk_bytes(reader, page_indices)
-                txns = transcribe_chunk(client, chunk_pdf, running_balance, n, len(chunks))
+                txns = transcribe_chunk(
+                    client, chunk_pdf, running_balance,
+                    n, len(chunks), page_start, page_end
+                )
 
                 for t in txns:
                     amt = float(t.get("amount", 0) or 0)
@@ -285,16 +291,16 @@ def process_job(job_id, files_data, opening_balance):
                 chunk_count += 1
                 job["progress"] = chunk_count
 
-        # Sort chronologically — handle many date formats gracefully
+        # Sort chronologically; credits before debits on same date
         from datetime import datetime
 
         DATE_FORMATS = [
             "%m/%d/%Y", "%m/%d/%y",
             "%Y-%m-%d",
             "%B %d, %Y", "%b %d, %Y",
-            "%B %d %Y",  "%b %d %Y",
-            "%d %B %Y",  "%d %b %Y",
-            "%m-%d-%Y",  "%m-%d-%y",
+            "%B %d %Y", "%b %d %Y",
+            "%d %B %Y", "%d %b %Y",
+            "%m-%d-%Y", "%m-%d-%y",
             "%d/%m/%Y",
         ]
 
@@ -306,9 +312,12 @@ def process_job(job_id, files_data, opening_balance):
                     return datetime.strptime(date_str.strip(), fmt)
                 except ValueError:
                     continue
-            return datetime.max  # unparseable dates go to end
+            return datetime.max
 
-        all_transactions.sort(key=lambda t: (parse_date(t.get("date", "")), 0 if t.get("type") == "credit" else 1))
+        all_transactions.sort(key=lambda t: (
+            parse_date(t.get("date", "")),
+            0 if t.get("type") == "credit" else 1
+        ))
 
         # Recalculate running balance after sort
         balance = opening_balance
@@ -345,11 +354,10 @@ def start():
     except ValueError:
         opening = 0.0
 
-    # Read file bytes immediately (can't pass file objects to thread)
     files_data = [(f.filename, f.read()) for f in files]
-
     job_id = str(uuid.uuid4())
-    jobs[job_id] = {"status": "running", "progress": 0, "total": 0, "transactions": [], "error": None, "count": 0}
+    jobs[job_id] = {"status": "running", "progress": 0, "total": 0,
+                    "transactions": [], "error": None, "count": 0}
 
     thread = threading.Thread(target=process_job, args=(job_id, files_data, opening), daemon=True)
     thread.start()
@@ -405,6 +413,5 @@ if __name__ == "__main__":
     import webbrowser
     from threading import Timer
     print("Starting Bank Statement Transcriber...")
-    print("Opening browser at http://localhost:5000")
     Timer(1, lambda: webbrowser.open("http://localhost:5000")).start()
     app.run(port=5000, debug=False)
